@@ -1,8 +1,10 @@
 # 01 — Platform Architecture
 
-Install a single-node Kubernetes cluster with kubeadm, then take a short tour of the components that make it work.
+What the installation built, which components make up the cluster, and how each one runs on your VM.
 
-**Before you start:** your VM must meet [../vm-requirements.md](../vm-requirements.md). Take a VM snapshot first.
+**Before you start:** a working cluster from the [installation guide](../installation-guide.md) (`kubectl get nodes` shows `Ready`).
+
+This chapter explains. The hands-on part is in the [exercises](exercises/README.md), where you find every component yourself.
 
 ---
 
@@ -10,234 +12,32 @@ Install a single-node Kubernetes cluster with kubeadm, then take a short tour of
 
 By the end of this chapter you can:
 
-- Install Kubernetes on Ubuntu with kubeadm, step by step.
-- Name the main cluster components and see each one running on your VM.
+- Explain what each installation step did and why it was needed.
+- Name the cluster components and say **how** each one runs: systemd service, static Pod or regular Pod.
 - Explain the difference between `kubectl` and `crictl`.
 - Tell namespaced resources from cluster-wide resources.
+- Describe how a Pod gets connected to the network.
 
 ---
 
-## Part 1 — Install the cluster
+## 1. What the installation did
 
-We install in this order:
+`02-install-k8s.sh` ran these steps. Each one exists for a reason:
 
-```text
-1. Prepare Ubuntu        (swap off, kernel modules, sysctl)
-2. Container runtime     (containerd)
-3. Kubernetes packages   (kubeadm, kubelet, kubectl)
-4. Create the cluster    (kubeadm init)
-5. Pod network           (Flannel CNI)
-6. Allow workloads       (remove control-plane taint — single node only)
-```
-
-> All commands run **inside the VM**.
-
-> **Shortcut:** the same steps are automated in the course scripts — see [../installation-guide.md](../installation-guide.md). Do the manual install below at least once to understand each step; use the scripts to reinstall quickly.
-
-### Step 1 — Prepare Ubuntu
-
-**1.1 Disable swap** (now and after reboot):
-
-```bash
-sudo swapoff -a
-sudo sed -i '/\sswap\s/ s/^/#/' /etc/fstab
-swapon --show        # no output = swap is off
-```
-
-Why: the kubelet calculates memory for Pods assuming there is no swap.
-
-**1.2 Load kernel modules:**
-
-```bash
-cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
-overlay
-br_netfilter
-EOF
-
-sudo modprobe overlay
-sudo modprobe br_netfilter
-```
-
-- `overlay` — the filesystem containerd uses for image layers.
-- `br_netfilter` — lets iptables see traffic that crosses the Linux bridge (Pod traffic).
-
-**1.3 Kernel network settings:**
-
-```bash
-cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
-net.bridge.bridge-nf-call-iptables  = 1
-net.bridge.bridge-nf-call-ip6tables = 1
-net.ipv4.ip_forward                 = 1
-EOF
-
-sudo sysctl --system
-sysctl net.ipv4.ip_forward     # expect: = 1
-```
-
-`ip_forward = 1` lets the node route packets between Pods and the outside world.
-
-### Step 2 — Install containerd (the container runtime)
-
-Kubernetes does not run containers itself. It asks a **container runtime** to do it, through the **CRI** (Container Runtime Interface). We use **containerd**.
-
-```bash
-sudo apt-get update
-sudo apt-get install -y containerd
-
-# Generate the default config and switch to the systemd cgroup driver
-sudo mkdir -p /etc/containerd
-containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
-sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-
-sudo systemctl restart containerd
-sudo systemctl enable containerd
-systemctl is-active containerd     # expect: active
-```
-
-Why `SystemdCgroup = true`: Ubuntu uses systemd to manage cgroups (CPU/RAM limits). kubelet and containerd must use the **same** cgroup driver, otherwise Pods restart randomly.
-
-```bash
-grep SystemdCgroup /etc/containerd/config.toml    # expect: SystemdCgroup = true
-```
-
-### Step 3 — Install kubeadm, kubelet and kubectl
-
-| Package | What it is |
-|---|---|
-| `kubeadm` | Tool that **builds** the cluster (certificates, config, control-plane) |
-| `kubelet` | The node agent — runs as a systemd service on every node |
-| `kubectl` | The CLI we use to talk to the cluster |
-
-```bash
-sudo apt-get install -y apt-transport-https ca-certificates curl gpg
-
-# Kubernetes package repository (version 1.36)
-sudo mkdir -p -m 755 /etc/apt/keyrings
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | \
-  sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-
-echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /' | \
-  sudo tee /etc/apt/sources.list.d/kubernetes.list
-
-sudo apt-get update
-sudo apt-get install -y kubelet kubeadm kubectl cri-tools
-sudo apt-mark hold kubelet kubeadm kubectl     # prevent accidental upgrades
-
-sudo systemctl enable kubelet
-```
-
-`apt-mark hold` matters: Kubernetes upgrades must be done in a controlled order, never by a random `apt upgrade`.
-
-`cri-tools` provides `crictl`, a debugging CLI for the container runtime (it is no longer installed automatically with kubeadm). Point it at containerd:
-
-```bash
-cat <<EOF | sudo tee /etc/crictl.yaml
-runtime-endpoint: unix:///run/containerd/containerd.sock
-EOF
-```
-
-> 📸 **Snapshot now** — "Prerequisites done". If `kubeadm init` goes wrong you can come back here.
-
-### Step 4 — Create the cluster
-
-Find your VM's static IP:
-
-```bash
-ip -4 addr show
-# use the cluster-facing IP, e.g. 192.168.149.133
-```
-
-Initialize the control plane:
-
-```bash
-sudo kubeadm init \
-  --apiserver-advertise-address=<YOUR-VM-IP> \
-  --pod-network-cidr=10.244.0.0/16
-```
-
-| Flag | Meaning |
-|---|---|
-| `--apiserver-advertise-address` | The IP the API server listens on and puts in its certificate |
-| `--pod-network-cidr` | The IP range for Pods. `10.244.0.0/16` is what Flannel expects |
-
-This takes 1–3 minutes. kubeadm prints its phases (`[preflight]`, `[certs]`, `[kubeconfig]`, `[control-plane]`, `[etcd]` ...) and ends with:
-
-```text
-Your Kubernetes control-plane has initialized successfully!
-```
-
-Give your user access to the cluster (`kubectl` reads `~/.kube/config`):
-
-```bash
-mkdir -p $HOME/.kube
-sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
-sudo chown $(id -u):$(id -g) $HOME/.kube/config
-```
-
-Check:
-
-```bash
-kubectl get nodes
-```
-
-```text
-NAME         STATUS     ROLES           AGE   VERSION
-k8s-lab      NotReady   control-plane   40s   v1.36.x
-```
-
-`NotReady` is expected — there is **no Pod network yet**.
-
-### Step 5 — Install the Pod network (Flannel)
-
-Kubernetes defines **CNI** (Container Network Interface) but does not ship a network. We install **Flannel**, a simple CNI that gives each Pod an IP from `10.244.0.0/16`.
-
-```bash
-kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
-```
-
-Wait for the node to become Ready:
-
-```bash
-kubectl wait --for=condition=Ready node --all --timeout=180s
-kubectl get nodes
-```
-
-```text
-NAME         STATUS   ROLES           AGE   VERSION
-k8s-lab      Ready    control-plane   2m    v1.36.x
-```
-
-### Step 6 — Allow workloads on the control-plane node
-
-By default the control-plane node has a **taint** that blocks regular Pods from running on it (in production, apps run on worker nodes). We have only one node, so we remove it:
-
-```bash
-kubectl taint nodes --all node-role.kubernetes.io/control-plane-
-```
-
-The `-` at the end means "remove".
-
-### Step 7 — Smoke test
-
-```bash
-kubectl create deployment hello --image=nginx
-kubectl get pods -o wide
-```
-
-```text
-NAME                     READY   STATUS    RESTARTS   AGE   IP           NODE
-hello-6d4bc4d5fb-lxvwn   1/1     Running   0          20s   10.244.0.4   k8s-lab
-```
-
-A Pod is `Running` with an IP from `10.244.0.0/16` — the cluster works.
-
-> 📸 **Snapshot now** — "Cluster ready".
+| Step | What it did | Why |
+|---|---|---|
+| Swap off | `swapoff -a` and removed swap from `/etc/fstab` | The kubelet calculates Pod memory assuming there is no swap |
+| Kernel modules | Loaded `overlay` and `br_netfilter` | `overlay`: the filesystem for image layers. `br_netfilter`: lets iptables see traffic that crosses a Linux bridge (Pod traffic) |
+| sysctl | `ip_forward = 1`, `bridge-nf-call-iptables = 1` | The node must route packets between Pods and the outside world |
+| containerd | Installed it and set `SystemdCgroup = true` | Kubernetes does not run containers itself. containerd and the kubelet must use the **same** cgroup driver, otherwise Pods restart randomly |
+| Packages | `kubeadm`, `kubelet`, `kubectl`, `cri-tools`, held with `apt-mark hold` | Kubernetes upgrades must be done in a controlled order, never by a random `apt upgrade` |
+| `kubeadm init` | Created certificates, kubeconfig files, etcd and the control plane | Builds the cluster. `--apiserver-advertise-address` is the node IP (baked into certificates — that is why the IP must be static). `--pod-network-cidr=10.244.0.0/16` is the Pod IP range |
+| Flannel | Installed the CNI plugin | Kubernetes defines the network interface (CNI) but ships no network. Until a CNI exists the node is `NotReady` |
+| Remove taint | Removed `node-role.kubernetes.io/control-plane:NoSchedule` | In production, apps run on worker nodes. We have one node, so it must also run our apps |
 
 ---
 
-## Part 2 — Tour of the platform
-
-Now let's find each component from [00-introduction](../00-introduction/00-introduction.md) on our VM.
+## 2. The architecture on one VM
 
 ```text
                    kubectl
@@ -260,238 +60,154 @@ Now let's find each component from [00-introduction](../00-introduction/00-intro
    CoreDNS ── service discovery     Flannel ── Pod network
 ```
 
-### 2.1 Who runs the containers? — containerd and crictl
+Two rules explain the whole picture:
 
-```bash
-sudo crictl ps
-```
+- **Everything goes through the API server.** `kubectl`, the scheduler, the controllers and the kubelet all talk only to kube-apiserver. Only the API server talks to etcd.
+- **etcd is the only place state is stored.** Every Deployment, Service and Secret lives there. Losing etcd without a backup means losing the cluster.
 
-```text
-CONTAINER   IMAGE   CREATED   STATE     NAME                      POD
-...                           Running   nginx                     hello-...
-...                           Running   coredns                   coredns-...
-...                           Running   kube-flannel              kube-flannel-ds-...
-...                           Running   kube-proxy                kube-proxy-...
-...                           Running   kube-scheduler            kube-scheduler-k8s-lab
-...                           Running   kube-controller-manager   kube-controller-manager-k8s-lab
-...                           Running   kube-apiserver            kube-apiserver-k8s-lab
-...                           Running   etcd                      etcd-k8s-lab
-```
+---
 
-What we see:
+## 3. How each component runs
 
-- **containerd** runs every container — our app *and* Kubernetes' own components.
-- `crictl` is a debugging CLI that talks **directly to the runtime** (like `docker ps`, but for CRI).
-- We do **not** use `docker` here — Kubernetes does not need Docker at all.
+The components do not all run the same way:
 
-| Tool | Talks to | Use it for |
-|---|---|---|
-| `kubectl` | kube-apiserver | Everything, day to day |
-| `crictl` | containerd (on this node only) | Low-level debugging on a node |
+| Component | Runs as | Namespace | Port | Job |
+|---|---|---|---|---|
+| containerd | systemd service | — | — | Runs every container, through the CRI |
+| kubelet | systemd service | — | 10250 | Node agent: starts Pods, reports node status |
+| kube-apiserver | static Pod | `kube-system` | **6443** | The front door. All requests come here |
+| etcd | static Pod | `kube-system` | 2379, 2380 | The cluster database |
+| kube-scheduler | static Pod | `kube-system` | 10259 (health) | Picks a node for each new Pod |
+| kube-controller-manager | static Pod | `kube-system` | 10257 (health) | Runs the controllers (chapter 02) |
+| kube-proxy | DaemonSet | `kube-system` | 10256 (health) | Programs Service routing rules on the node |
+| CoreDNS | Deployment | `kube-system` | 53 (inside the cluster) | DNS names for Services |
+| Flannel | DaemonSet | `kube-flannel` | — | Pod network |
 
-### 2.2 The front door — kube-apiserver
-
-```bash
-kubectl cluster-info
-```
+### Why three different ways?
 
 ```text
-Kubernetes control plane is running at https://192.168.149.133:6443
-CoreDNS is running at https://192.168.149.133:6443/api/v1/namespaces/kube-system/services/kube-dns:dns/proxy
+systemd ──starts──► containerd + kubelet
+                          │
+                          │ kubelet reads /etc/kubernetes/manifests/
+                          ▼
+                    static Pods: etcd, kube-apiserver,
+                                 scheduler, controller-manager
+                          │
+                          │ now the API server is up
+                          ▼
+                    regular Pods: kube-proxy, Flannel, CoreDNS, your apps
 ```
 
-```bash
-sudo ss -ltnp | grep 6443
-```
+- **systemd services** — the kubelet runs Pods, so it cannot itself be a Pod. Something outside Kubernetes must start it.
+- **static Pods** — the control plane is needed *before* there is an API server to ask. The kubelet runs these straight from YAML files in `/etc/kubernetes/manifests/`, which `kubeadm init` wrote. To change one, you edit the file; deleting the Pod with `kubectl` does not remove it.
+- **regular Pods** — once the API server is up, everything else is managed the normal Kubernetes way. A **DaemonSet** runs one copy on every node, which is what node-level networking needs.
+
+Static Pod names end with the node name: `kube-apiserver-k8s-lab`.
+
+### Ports: who can reach what
+
+Each component listens only where it has to:
 
 ```text
-LISTEN 0  4096  *:6443  *:*  users:(("kube-apiserver",pid=...))
+*:PORT           reachable from anywhere     (6443 API server, 10250 kubelet)
+127.0.0.1:PORT   reachable only on the node  (health checks, metrics)
 ```
 
-- `kubectl` only ever talks to the **API server**, on port **6443**, over **HTTPS**.
-- Every action in Kubernetes starts with a request to the API server.
-- `kubectl` finds the address and its credentials in `~/.kube/config`:
+The scheduler and controller-manager have only health ports because they never receive requests — they **call** the API server.
 
-```bash
-grep server ~/.kube/config
-```
+---
 
-### 2.3 Where do the control-plane components come from? — static Pods
+## 4. kubectl vs crictl
 
-The control-plane components run as Pods, but who starts them before there is an API server? The **kubelet** does, from files on disk:
+| Tool | Talks to | Sees | Use it for |
+|---|---|---|---|
+| `kubectl` | kube-apiserver | The whole cluster: Deployments, Services, namespaces... | Everything, day to day |
+| `crictl` | containerd, on **this node only** | Pods and containers only | Low-level debugging on a node |
 
-```bash
-ls /etc/kubernetes/manifests/
-```
+Docker is not part of the cluster at all. containerd runs every container — your apps and Kubernetes' own components.
 
-```text
-etcd.yaml  kube-apiserver.yaml  kube-controller-manager.yaml  kube-scheduler.yaml
-```
+If you kill a container with `crictl`, the kubelet notices and starts it again. The desired state lives in the API, not in the runtime.
 
-These are **static Pods**: the kubelet watches this folder and runs whatever is in it. kubeadm wrote these files during `kubeadm init`.
+---
 
-### 2.4 The node agent — kubelet
+## 5. Namespaces
 
-The kubelet is the only Kubernetes component that is **not** a container. It is a regular systemd service:
+A **namespace** is a logical group inside the cluster:
 
-```bash
-systemctl status kubelet --no-pager | head -5
-```
+| Namespace | Holds |
+|---|---|
+| `default` | Your resources, when you don't choose a namespace |
+| `kube-system` | Kubernetes' own components |
+| `kube-flannel` | The Flannel CNI |
+| `kube-public`, `kube-node-lease` | Cluster info and node heartbeats |
 
-```text
-● kubelet.service - kubelet: The Kubernetes Node Agent
-     Active: active (running)
-```
+Not every resource lives in a namespace:
 
-If the kubelet stops, the node becomes `NotReady` and nothing on it is managed.
-
-### 2.5 The cluster database — etcd
-
-```bash
-sudo ls /var/lib/etcd/member/
-```
-
-```text
-snap  wal
-```
-
-- **etcd** stores the full desired state of the cluster (every Deployment, Service, Secret ...).
-- Only the API server talks to etcd.
-- Losing etcd without a backup = losing the cluster.
-
-### 2.6 The node
-
-```bash
-kubectl get nodes -o wide
-```
-
-```text
-NAME      STATUS   ROLES           VERSION   INTERNAL-IP       OS-IMAGE             CONTAINER-RUNTIME
-k8s-lab   Ready    control-plane   v1.36.x   192.168.149.133   Ubuntu 24.04.x LTS   containerd://1.7.x   (2.x on Ubuntu 26.04)
-```
-
-- Our cluster has one **Node**, with the role **control-plane** (and, after removing the taint, it runs apps too).
-- `INTERNAL-IP` is the static IP we gave `kubeadm init`.
-- `CONTAINER-RUNTIME` confirms containerd.
-
-### 2.7 Pods and Namespaces
-
-```bash
-kubectl get pods -A
-```
-
-```text
-NAMESPACE      NAME                              READY   STATUS
-default        hello-6d4bc4d5fb-lxvwn            1/1     Running
-kube-flannel   kube-flannel-ds-bxgqg             1/1     Running
-kube-system    coredns-...                       1/1     Running
-kube-system    etcd-k8s-lab                      1/1     Running
-kube-system    kube-apiserver-k8s-lab            1/1     Running
-kube-system    kube-controller-manager-k8s-lab   1/1     Running
-kube-system    kube-proxy-...                    1/1     Running
-kube-system    kube-scheduler-k8s-lab            1/1     Running
-```
-
-```bash
-kubectl get namespaces
-```
-
-```text
-NAME              STATUS
-default           Active
-kube-flannel      Active
-kube-node-lease   Active
-kube-public       Active
-kube-system       Active
-```
-
-- A **Namespace** is a logical group inside the cluster.
-- `kube-system` holds Kubernetes' own components; `default` is where our resources go if we don't choose a namespace.
-- `-A` means "all namespaces".
-
-### 2.8 Namespaced vs cluster-wide resources
-
-```bash
-kubectl api-resources | head -20
-```
-
-Look at the `NAMESPACED` column:
-
-| Namespaced (`true`) | Cluster-wide (`false`) |
+| Namespaced | Cluster-wide |
 |---|---|
 | Pods, Deployments, Services, ConfigMaps, Secrets | Nodes, Namespaces, PersistentVolumes |
 
-A Pod always lives in a namespace. A Node belongs to the whole cluster.
+A Pod always belongs to a namespace. A Node belongs to the whole cluster. `kubectl api-resources` shows this in the `NAMESPACED` column.
 
-### 2.9 The Pod network on the host
+---
 
-```bash
-ip -4 addr show cni0
-ip route | grep 10.244
-```
+## 6. The Pod network, in short
+
+When a Pod is created:
+
+1. containerd creates a **network namespace** for the Pod.
+2. The CNI (Flannel, using the `bridge` plugin) creates a **veth pair** — a virtual cable with two ends:
+   - one end goes inside the Pod and is called `eth0`,
+   - the other end stays on the node (`vethXXXX`) and is plugged into the bridge **`cni0`**.
+3. The Pod gets an IP from the node's slice of the Pod range.
 
 ```text
-cni0: ... inet 10.244.0.1/24
-10.244.0.0/24 dev cni0 proto kernel scope link src 10.244.0.1
+ ┌── Pod A ─────────┐   ┌── Pod B ─────────┐
+ │ eth0 10.244.0.5  │   │ eth0 10.244.0.6  │
+ └────────┬─────────┘   └────────┬─────────┘
+       vethaaaa              vethbbbb
+          └──────────┬───────────┘
+              cni0  10.244.0.1   (bridge, Pods' gateway)
+                     │
+              node routing ──► flannel.1 (VXLAN) ──► Pods on other nodes
 ```
 
-- Flannel created a Linux bridge, `cni0`, as the gateway for Pods on this node.
-- Each node gets its own slice (`10.244.0.0/24`) of the Pod range (`10.244.0.0/16`).
-- Pod networking is regular Linux networking — interfaces and routes.
+- Pod range: `10.244.0.0/16`. Each node gets its own `/24` slice (ours: `10.244.0.0/24`).
+- **One veth per Pod**, not per container. Containers in a Pod share one IP.
+- Pods with `hostNetwork: true` (the control plane, kube-proxy, Flannel) skip all this and use the node IP directly.
+- It is all regular Linux networking: interfaces, a bridge and routes.
 
 ---
 
 ## Summary
 
-| Component | Where it runs on our VM | How we saw it |
-|---|---|---|
-| kube-apiserver | static Pod | `kubectl cluster-info`, `ss -ltnp \| grep 6443` |
-| etcd | static Pod | `/var/lib/etcd` |
-| scheduler / controller-manager | static Pods | `/etc/kubernetes/manifests` |
-| kubelet | systemd service | `systemctl status kubelet` |
-| containerd | systemd service | `sudo crictl ps` |
-| kube-proxy, CoreDNS | Pods in `kube-system` | `kubectl get pods -A` |
-| Flannel (CNI) | Pod in `kube-flannel` | `cni0`, `ip route` |
-
-Key ideas:
-
-- `kubectl` → API server is the **only** way we manage the cluster.
-- Kubernetes runs its own control plane **as Pods**, started by the kubelet from static manifests.
-- containerd runs all containers; `crictl` is for node-level debugging.
+- The install prepared Linux (swap, modules, sysctl), added a runtime (containerd), built the control plane (`kubeadm init`) and a network (Flannel).
+- Everything talks to the **API server**; only the API server talks to **etcd**.
+- kubelet and containerd are **systemd services**; the control plane is **static Pods**; everything else is **regular Pods**.
+- `kubectl` sees the cluster; `crictl` sees one node's containers.
 - Resources are either **namespaced** or **cluster-wide**.
+- Each Pod is wired to `cni0` with a **veth pair**.
 
----
+### Check yourself
 
-## Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `kubeadm init` fails on `[preflight]` swap | Swap still on | `sudo swapoff -a`, fix `/etc/fstab` |
-| Preflight: `bridge-nf-call-iptables` / `ip_forward` | sysctl not applied | Repeat Step 1.3 |
-| Node stays `NotReady` | No CNI, or Flannel not running | `kubectl get pods -n kube-flannel` |
-| Pods keep restarting, control plane unstable | cgroup driver mismatch | Check `SystemdCgroup = true`, restart containerd |
-| `kubectl`: `connection refused ... :6443` | API server down, or no kubeconfig | `sudo crictl ps \| grep apiserver`, check `~/.kube/config` |
-| Cluster broken after reboot | VM IP changed | Use a static IP (see vm-requirements) |
-
-Start over (if needed):
-
-```bash
-sudo kubeadm reset -f
-sudo rm -rf $HOME/.kube /etc/cni/net.d
-# then repeat from Step 4 (or restore the "Prerequisites done" snapshot)
-```
+1. Why is the kubelet not a Pod?
+2. You delete `kube-apiserver-k8s-lab` with `kubectl`. What happens, and why?
+3. Why must the node IP never change after `kubeadm init`?
+4. A Pod has two containers. How many IPs and how many veth pairs does it get?
+5. Is a Namespace itself namespaced?
 
 ---
 
 ## Exercises
 
-In-class exploration exercises for this chapter: [exercises/](exercises/README.md)
+Find each component on your VM: [exercises/](exercises/README.md)
 
 ---
 
 ## Further reading
 
-- [Installing kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/)
+- [Cluster components](https://kubernetes.io/docs/concepts/overview/components/)
 - [Creating a cluster with kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/create-cluster-kubeadm/)
 - [Container runtimes](https://kubernetes.io/docs/setup/production-environment/container-runtimes/)
 - [Static Pods](https://kubernetes.io/docs/tasks/configure-pod-container/static-pod/)
+- [Cluster networking](https://kubernetes.io/docs/concepts/cluster-administration/networking/)

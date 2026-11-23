@@ -282,7 +282,7 @@ Take a snapshot named **`static-ip`**. This is the best point to return to if yo
 
 ## Step 6 — Install Kubernetes: `02-install-k8s.sh`
 
-This performs the same 7 steps as Part 1 of [chapter 01](01-platform-architecture/01-platform-architecture.md): prepare Ubuntu, install containerd, install kubeadm/kubelet/kubectl, `kubeadm init`, Flannel, remove the control-plane taint, and a smoke test.
+This prepares Ubuntu, installs containerd, installs kubeadm/kubelet/kubectl, runs `kubeadm init`, installs Flannel, removes the control-plane taint, and runs a smoke test. [Chapter 01](01-platform-architecture/01-platform-architecture.md#1-what-the-installation-did) explains why each step is needed.
 
 ### 6.1 Dry run — preflight checks
 
@@ -393,7 +393,7 @@ kubectl get pods -A
 
 Take a snapshot named **`cluster-ready`**. Every lab in the course starts from here.
 
-You are ready for [chapter 01 — Part 2: Tour of the platform](01-platform-architecture/01-platform-architecture.md#part-2--tour-of-the-platform).
+You are ready for [chapter 01 — Platform Architecture](01-platform-architecture/01-platform-architecture.md).
 
 ---
 

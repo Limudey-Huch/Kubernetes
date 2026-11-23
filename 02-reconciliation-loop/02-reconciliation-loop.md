@@ -2,7 +2,9 @@
 
 How Kubernetes keeps your application running: desired state, actual state, and the controllers that keep checking and fixing the difference.
 
-**Before you start:** a working cluster from [01-platform-architecture](../01-platform-architecture/01-platform-architecture.md) (`kubectl get nodes` shows `Ready`).
+**Before you start:** a working cluster (`kubectl get nodes` shows `Ready`) and [chapter 01](../01-platform-architecture/01-platform-architecture.md).
+
+This chapter explains. The hands-on part is in the [exercises](exercises/README.md), where you break things and watch Kubernetes repair them.
 
 ---
 
@@ -13,13 +15,11 @@ By the end of this chapter you can:
 - Explain **desired state**, **actual state** and **reconciliation**.
 - Describe the chain **Deployment → ReplicaSet → Pod** and why there are three objects.
 - Say what a **controller** is and where controllers run.
-- Show self-healing in practice: delete things and watch Kubernetes bring them back.
+- Predict what Kubernetes does when you delete each level of the chain.
 
 ---
 
-## Part 1 — Theory
-
-### Kubernetes does not run commands — it keeps a promise
+## 1. Kubernetes does not run commands — it keeps a promise
 
 With Docker you give **commands**: "run this container". It runs once. If it dies, it stays dead (unless a restart policy catches it on that same host).
 
@@ -51,9 +51,13 @@ With Kubernetes you declare **what should exist**: "there should always be 3 cop
               (forever)
 ```
 
-This is called the **reconciliation loop** (or control loop). It never stops. That is why a crashed Pod comes back without anyone touching it — this is **self-healing**.
+This is the **reconciliation loop** (or control loop). It never stops. That is why a crashed Pod comes back without anyone touching it — this is **self-healing**.
 
-### Controllers
+Controllers do not replay your commands. Each time around the loop they look at the **current** desired state and close the gap. If you ask for 5 replicas and then for 2 before anything happened, the controller simply makes 2.
+
+---
+
+## 2. Controllers
 
 A **controller** is a small program that runs one reconciliation loop for **one type of object**:
 
@@ -64,35 +68,18 @@ A **controller** is a small program that runs one reconciliation loop for **one 
 | Node controller | Nodes | dead nodes are noticed |
 | Garbage collector | Owner links | children are deleted when their owner is deleted |
 
-All the built-in controllers run inside **one** control-plane component: **kube-controller-manager** (we saw it as a static Pod in chapter 01).
+- All the built-in controllers run inside **one** control-plane component: **kube-controller-manager**, a static Pod in `kube-system` (chapter 01).
+- It starts them all with `--controllers=*`.
+- With `--leader-elect=true`, a cluster with several control-plane nodes runs only **one** active controller-manager at a time (the "leader"). The others wait.
+- Controllers never talk to each other. Each one only **watches the API server** and **writes to the API server**.
 
-Controllers never talk to each other directly. Each one only **watches the API server** and **writes to the API server**.
+If kube-controller-manager stops, `kubectl` still works (it talks to the API server), and your changes are still saved — but nothing acts on them until it comes back. [Exercise 005](exercises/005-stop-the-controllers.md) shows this.
 
 ---
 
-## Part 2 — The workload hierarchy
+## 3. The workload hierarchy
 
-### Deploy an application
-
-```bash
-kubectl create deployment hello --image=nginx --replicas=3
-kubectl get deploy,rs,pods
-```
-
-```text
-NAME                    READY   UP-TO-DATE   AVAILABLE   AGE
-deployment.apps/hello   3/3     3            3           4s
-
-NAME                               DESIRED   CURRENT   READY   AGE
-replicaset.apps/hello-558494cd6d   3         3         3       4s
-
-NAME                         READY   STATUS    RESTARTS   AGE
-pod/hello-558494cd6d-695xs   1/1     Running   0          4s
-pod/hello-558494cd6d-dhdvr   1/1     Running   0          4s
-pod/hello-558494cd6d-rdbdt   1/1     Running   0          4s
-```
-
-One command created **three kinds** of objects.
+One command, `kubectl create deployment hello --image=nginx --replicas=3`, creates **three kinds** of objects:
 
 ```text
 Deployment  hello                     "I want 3 nginx Pods, this version"
@@ -111,162 +98,36 @@ ReplicaSet  hello-558494cd6d          "I keep exactly 3 Pods alive"
 | **ReplicaSet** | Keeps the **number** of Pods correct. Nothing more. |
 | **Pod** | The actual running container(s). Disposable. |
 
-Why three and not one? **Each object has one responsibility.** The ReplicaSet only counts Pods. The Deployment only manages versions (each version gets its own ReplicaSet). Small, focused loops are easier to make reliable.
+Why three and not one? **Each object has one responsibility.** The ReplicaSet only counts Pods. The Deployment only manages versions — each version of the Pod template gets its own ReplicaSet. Small, focused loops are easier to make reliable.
 
-> Notice the names: `hello` → `hello-558494cd6d` → `hello-558494cd6d-695xs`. Each child carries its parent's name plus a random suffix.
+### Names and owners
 
-### Who owns whom?
-
-```bash
-kubectl describe rs -l app=hello | grep "Controlled By"
-kubectl describe pod -l app=hello | grep "Controlled By"
-```
-
-```text
-Controlled By:  Deployment/hello
-Controlled By:  ReplicaSet/hello-558494cd6d
-```
-
-Every child records its owner (in a field called `ownerReferences`). This link is how Kubernetes knows what to clean up later.
-
-### Where do the controllers run?
-
-```bash
-kubectl get pods -n kube-system | grep controller-manager
-```
-
-```text
-kube-controller-manager-k8s-lab   1/1     Running   0          20m
-```
-
-```bash
-sudo ps -ww -C kube-controller-manager -o args= | tr ' ' '\n' | grep -E '^--controllers|^--leader'
-```
-
-```text
---controllers=*,bootstrapsigner,tokencleaner
---leader-elect=true
-```
-
-- `--controllers=*` — run all the built-in controllers.
-- `--leader-elect=true` — in a cluster with several control-plane nodes, only one controller-manager is active at a time (the "leader").
+- Each child carries its parent's name plus a suffix: `hello` → `hello-558494cd6d` → `hello-558494cd6d-695xs`. The ReplicaSet suffix is a hash of the Pod template.
+- Every child records its owner in a field called **`ownerReferences`** (`kubectl describe` shows it as `Controlled By`).
+- This link is how Kubernetes knows which controller manages an object, and what to delete when the owner is deleted.
 
 ---
 
-## Part 3 — Watch reconciliation happen
+## 4. What happens when you change or delete things
 
-Open **two terminals** to the VM.
+| You do | What the loop sees | Who fixes it | Result |
+|---|---|---|---|
+| Delete a Pod | ReplicaSet: 2 Pods, wants 3 | ReplicaSet controller | A **new** Pod, with a new name. Pods are replaced, never restarted |
+| Scale 3 → 5 (or 5 → 2) | ReplicaSet desired number changed | ReplicaSet controller | Pods added (or the newest removed) |
+| Delete the ReplicaSet | Deployment: no ReplicaSet for its template | Deployment controller | The ReplicaSet and its Pods come back within seconds |
+| Delete the Deployment | The owner is gone | Garbage collector | ReplicaSet and Pods removed. Nothing comes back |
 
-**Terminal 1** — keep this running for all the experiments:
+> **Rule:** to really remove an application, delete the object at the **top** (the Deployment). Deleting anything below it only triggers reconciliation.
 
-```bash
-watch -n1 kubectl get deploy,rs,pods
-```
+Notice what each row changes: deleting objects changes the **actual** state, so the controllers repair it. Scaling changes the **desired** state, so the controllers follow it. Deleting the Deployment removes the desired state itself, so there is nothing left to repair.
 
-Run each experiment in **Terminal 2** and watch Terminal 1.
-
-### Experiment 1 — Delete a Pod
-
-```bash
-kubectl delete pod <one-of-the-hello-pods>
-```
-
-What you see in Terminal 1:
-
-```text
-pod/hello-558494cd6d-58j9h   0/1     ContainerCreating   0     1s    ← new Pod
-pod/hello-558494cd6d-5qnrd   1/1     Terminating         0     15s   ← the one you deleted
-pod/hello-558494cd6d-vb9hg   1/1     Running             0     15s
-pod/hello-558494cd6d-ztlp9   1/1     Running             0     15s
-```
-
-What happened:
-
-```text
-desired: 3 Pods      actual: 2 Pods
-          └── ReplicaSet controller: "1 missing" ──► creates a new Pod
-```
-
-The new Pod has a **new name**. Kubernetes did not "restart" the old Pod — it replaced it. Pods are disposable.
-
-### Experiment 2 — Change the desired state (scale)
-
-```bash
-kubectl scale deployment hello --replicas=5
-```
-
-```text
-replicaset.apps/hello-558494cd6d   5         5         5       7s
-```
-
-Two new Pods appear. Now scale down:
-
-```bash
-kubectl scale deployment hello --replicas=2
-```
-
-Three Pods go to `Terminating`. We changed only the **desired** number — the controllers did the rest.
-
-### Experiment 3 — Delete the ReplicaSet
-
-```bash
-kubectl delete rs -l app=hello
-```
-
-```text
-NAME                               DESIRED   CURRENT   READY   AGE
-replicaset.apps/hello-558494cd6d   2         2         2       4s
-```
-
-The ReplicaSet was deleted (and its Pods with it) — and **4 seconds later it is back**, with new Pods. Why? The **Deployment** still exists and still says "I want a ReplicaSet with 2 Pods". The Deployment controller reconciled.
-
-### Experiment 4 — Delete the Deployment
-
-```bash
-kubectl delete deployment hello
-```
-
-```text
-No resources found in default namespace.
-```
-
-This time nothing comes back. The Deployment was the **top of the chain** — the desired state itself. With the owner gone, the **garbage collector** removed the ReplicaSet and the Pods.
-
-### Summary of the experiments
-
-| You deleted | Who fixed it | Result |
-|---|---|---|
-| A Pod | ReplicaSet controller | New Pod created |
-| *(changed replicas)* | ReplicaSet controller | Pods added / removed |
-| The ReplicaSet | Deployment controller | New ReplicaSet + Pods created |
-| The Deployment | Garbage collector | Everything below it removed |
-
-> **Rule:** to really remove an application, delete the object at the **top** (the Deployment). Deleting things below it only triggers reconciliation.
+Try each row in exercises [002](exercises/002-self-healing.md), [003](exercises/003-scaling.md) and [004](exercises/004-ownership-and-deletion.md).
 
 ---
 
-## Part 4 — Events: the story of what happened
+## 5. Events: the story of what happened
 
-Controllers report what they do as **events**:
-
-```bash
-kubectl create deployment hello --image=nginx --replicas=3
-kubectl delete pod $(kubectl get pods -l app=hello -o name | head -1 | cut -d/ -f2)
-kubectl get events --sort-by=.lastTimestamp | tail -10
-```
-
-Look for the lines about the **new** Pod (events from the other Pods are mixed in):
-
-```text
-Normal  Killing           pod/hello-558494cd6d-5qnrd     Stopping container nginx
-Normal  SuccessfulCreate  replicaset/hello-558494cd6d    Created pod: hello-558494cd6d-58j9h
-Normal  Scheduled         pod/hello-558494cd6d-58j9h     Successfully assigned default/hello-558494cd6d-58j9h to k8s-lab
-Normal  Pulled            pod/hello-558494cd6d-58j9h     Successfully pulled image "nginx" ...
-Normal  Created           pod/hello-558494cd6d-58j9h     Container created
-Normal  Started           pod/hello-558494cd6d-58j9h     Container started
-```
-
-Read it as a chain of responsibility:
+Controllers and other components report what they do as **events** (`kubectl get events`). After a Pod is deleted, the events read as a chain of responsibility:
 
 ```text
 ReplicaSet controller → creates the Pod object       (SuccessfulCreate)
@@ -274,11 +135,9 @@ Scheduler             → picks a node                  (Scheduled)
 kubelet               → pulls image, starts container (Pulled, Created, Started)
 ```
 
-Clean up:
+No component does the whole job. Each one sees a change in the API, does its own step, and writes the result back. The next component picks it up from there.
 
-```bash
-kubectl delete deployment hello
-```
+Events are also the first place to look when something does **not** reconcile — an image that cannot be pulled, or a Pod that no node can take ([exercise 006](exercises/006-fix-a-broken-deployment.md)).
 
 ---
 
@@ -287,7 +146,7 @@ kubectl delete deployment hello
 - Kubernetes stores a **desired state** and continuously makes the **actual state** match it.
 - This continuous compare-and-fix is the **reconciliation loop**; it gives us **self-healing**.
 - A **controller** runs one loop for one object type. Built-in controllers live in **kube-controller-manager**.
-- **Deployment → ReplicaSet → Pod**: each layer owns and manages the next.
+- **Deployment → ReplicaSet → Pod**: each layer owns and manages the next, through `ownerReferences`.
 - Deleting a child triggers reconciliation; deleting the **owner** removes everything below it.
 
 ### Check yourself
@@ -296,6 +155,7 @@ kubectl delete deployment hello
 2. What is the difference between `kubectl delete pod ...` and `kubectl scale ... --replicas=...`?
 3. Why does deleting a ReplicaSet not remove the application?
 4. Which control-plane component hosts the Deployment and ReplicaSet controllers?
+5. kube-controller-manager is down and you scale a Deployment to 5. Is the request lost?
 
 ---
 
@@ -312,7 +172,7 @@ kubectl delete deployment hello
 
 ## Exercises
 
-In-class exercises for this chapter: [exercises/](exercises/README.md)
+Break things and watch them heal: [exercises/](exercises/README.md)
 
 ---
 
